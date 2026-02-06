@@ -9,7 +9,9 @@ import re
 import signal
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from threading import Lock
 
 import duckdb
 from google import genai
@@ -20,8 +22,13 @@ from dotenv import load_dotenv
 DEFAULT_DB_PATH = "twitter.db"
 BATCH_SIZE = 10  # Number of tweets per API call
 SAVE_INTERVAL = 50  # Save progress every N tweets
-RATE_LIMIT_DELAY = 0.5  # Seconds between API calls
+RATE_LIMIT_DELAY = 0.5  # Seconds between API calls (not used in parallel mode)
 LOG_FILE = "categorization.log"
+MAX_WORKERS = 10  # Number of parallel workers for API calls
+
+# Thread-safe locks for shared resources
+db_lock = Lock()  # For database writes and custom category operations
+log_lock = Lock()  # For ordered logging
 
 # Set up file logger for detailed categorization logging
 cat_logger = logging.getLogger("categorization")
@@ -294,62 +301,60 @@ Rules:
     return prompt
 
 
-def categorize_batch(client, conn: duckdb.DuckDBPyConnection, tweets: list) -> list:
-    """Categorize a batch of tweets using Gemini API with dynamic category support."""
+def categorize_single_tweet(client, conn: duckdb.DuckDBPyConnection,
+                           tweet_data: tuple, custom_categories: list) -> list:
+    """Categorize a single tweet using Gemini API. Thread-safe."""
+    tweet_id, full_text, created_at, lang = tweet_data
     results = []
 
-    # Get custom categories at batch start
-    custom_categories = get_custom_categories(conn)
+    if shutdown_requested:
+        return results
 
-    for tweet_id, full_text, created_at, lang in tweets:
-        if shutdown_requested:
-            break
+    try:
+        # Build dynamic prompt with current custom categories (always allow new categories)
+        prompt_template = build_category_prompt(custom_categories, can_create_new=True)
+        prompt = prompt_template.format(tweet_text=full_text[:1000])  # Limit text length
 
-        try:
-            # Build dynamic prompt with current custom categories (always allow new categories)
-            prompt_template = build_category_prompt(custom_categories, can_create_new=True)
-            prompt = prompt_template.format(tweet_text=full_text[:1000])  # Limit text length
+        response = client.models.generate_content(
+            model="gemini-2.0-flash-lite",
+            contents=prompt
+        )
 
-            response = client.models.generate_content(
-                model="gemini-2.0-flash-lite",
-                contents=prompt
-            )
+        # Parse JSON response
+        response_text = response.text.strip()
+        # Remove markdown code blocks if present
+        if response_text.startswith("```"):
+            lines = response_text.split("\n")
+            # Skip the first line (```json or ```) and remove the last line (```)
+            response_text = "\n".join(lines[1:-1]).strip() if len(lines) > 2 else response_text
 
-            # Parse JSON response
-            response_text = response.text.strip()
-            # Remove markdown code blocks if present
-            if response_text.startswith("```"):
-                lines = response_text.split("\n")
-                # Skip the first line (```json or ```) and remove the last line (```)
-                response_text = "\n".join(lines[1:-1]).strip() if len(lines) > 2 else response_text
+        data = json.loads(response_text)
 
-            data = json.loads(response_text)
+        # Handle various response formats
+        if isinstance(data, dict):
+            categories = data.get("categories", [])
+            if not categories:
+                primary = data.get("primary", "other")
+                categories = [primary] if primary else ["other"]
+            confidence = data.get("confidence", 0.5)
+        else:
+            # Unexpected format
+            categories = ["other"]
+            confidence = 0.0
 
-            # Handle various response formats
-            if isinstance(data, dict):
-                categories = data.get("categories", [])
-                if not categories:
-                    primary = data.get("primary", "other")
-                    categories = [primary] if primary else ["other"]
-                confidence = data.get("confidence", 0.5)
-            else:
-                # Unexpected format
-                categories = ["other"]
-                confidence = 0.0
+        # Handle new category creation (thread-safe)
+        new_category = data.get("new_category") if isinstance(data, dict) else None
+        if new_category and isinstance(new_category, dict):
+            cat_name = new_category.get("name", "").lower().strip()
+            cat_desc = new_category.get("description", "")
 
-            # Handle new category creation
-            new_category = data.get("new_category") if isinstance(data, dict) else None
-            if new_category and isinstance(new_category, dict):
-                cat_name = new_category.get("name", "").lower().strip()
-                cat_desc = new_category.get("description", "")
+            if cat_name and cat_desc:
+                with db_lock:
+                    add_custom_category(conn, cat_name, cat_desc, tweet_id)
 
-                if cat_name and cat_desc:
-                    if add_custom_category(conn, cat_name, cat_desc, tweet_id):
-                        # Refresh custom categories for subsequent tweets in this batch
-                        custom_categories = get_custom_categories(conn)
-
-            # Log the tweet processing and categorization decision
-            primary_category = data.get("primary", categories[0] if categories else "other")
+        # Log the tweet processing and categorization decision (thread-safe)
+        primary_category = data.get("primary", categories[0] if categories else "other")
+        with log_lock:
             log_tweet_processing(
                 tweet_id=tweet_id,
                 full_text=full_text,
@@ -358,8 +363,10 @@ def categorize_batch(client, conn: duckdb.DuckDBPyConnection, tweets: list) -> l
                 confidence=confidence
             )
 
-            # Track custom category usage
-            existing_custom_cats = {c[0] for c in custom_categories}
+        # Track custom category usage (get fresh list with lock)
+        with db_lock:
+            current_custom_cats = get_custom_categories(conn)
+            existing_custom_cats = {c[0] for c in current_custom_cats}
             all_known_cats = set(STANDARD_CATEGORIES) | existing_custom_cats
 
             for cat in categories:
@@ -372,8 +379,8 @@ def categorize_batch(client, conn: duckdb.DuckDBPyConnection, tweets: list) -> l
                         # Auto-create the category
                         desc = f"Auto-created category: {cat_lower}"
                         if add_custom_category(conn, cat_lower, desc, tweet_id):
-                            custom_categories = get_custom_categories(conn)
-                            existing_custom_cats = {c[0] for c in custom_categories}
+                            current_custom_cats = get_custom_categories(conn)
+                            existing_custom_cats = {c[0] for c in current_custom_cats}
                             all_known_cats = set(STANDARD_CATEGORIES) | existing_custom_cats
 
                 # Increment usage count for custom categories
@@ -387,40 +394,71 @@ def categorize_batch(client, conn: duckdb.DuckDBPyConnection, tweets: list) -> l
                     "raw_response": response_text
                 })
 
-            time.sleep(RATE_LIMIT_DELAY)  # Rate limiting
-
-        except json.JSONDecodeError as e:
-            print(f"  ⚠️  JSON parse error for tweet {tweet_id}: {e}")
-            # Show raw response for debugging
-            raw = response.text if 'response' in locals() else str(e)
-            if len(raw) < 200:
-                print(f"      Raw response: {raw}")
-            results.append({
-                "tweet_id": tweet_id,
-                "category": "other",
-                "confidence": 0.0,
-                "raw_response": raw
-            })
-        except Exception as e:
-            print(f"  ❌ Error categorizing tweet {tweet_id}: {e}")
-            if "429" in str(e) or "rate" in str(e).lower():
-                print("  ⏳ Rate limited. Waiting 60 seconds...")
-                time.sleep(60)
-            time.sleep(1)  # Brief pause on error
+    except json.JSONDecodeError as e:
+        print(f"  ⚠️  JSON parse error for tweet {tweet_id}: {e}")
+        # Show raw response for debugging
+        raw = response.text if 'response' in locals() else str(e)
+        if len(raw) < 200:
+            print(f"      Raw response: {raw}")
+        results.append({
+            "tweet_id": tweet_id,
+            "category": "other",
+            "confidence": 0.0,
+            "raw_response": raw
+        })
+    except Exception as e:
+        print(f"  ❌ Error categorizing tweet {tweet_id}: {e}")
+        if "429" in str(e) or "rate" in str(e).lower():
+            print("  ⏳ Rate limited. Waiting 60 seconds...")
+            time.sleep(60)
+        time.sleep(1)  # Brief pause on error
 
     return results
 
 
+def categorize_batch(client, conn: duckdb.DuckDBPyConnection, tweets: list) -> list:
+    """Categorize a batch of tweets in parallel using ThreadPoolExecutor."""
+    if not tweets:
+        return []
+
+    # Get custom categories at batch start
+    custom_categories = get_custom_categories(conn)
+
+    # Process tweets in parallel using ThreadPoolExecutor
+    all_results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all tweets for parallel processing
+        future_to_tweet = {
+            executor.submit(categorize_single_tweet, client, conn, tweet, custom_categories): tweet
+            for tweet in tweets
+        }
+
+        # Collect results as they complete
+        for future in as_completed(future_to_tweet):
+            if shutdown_requested:
+                break
+            try:
+                results = future.result()
+                all_results.extend(results)
+            except Exception as e:
+                tweet = future_to_tweet[future]
+                tweet_id = tweet[0]
+                print(f"  ❌ Unexpected error processing tweet {tweet_id}: {e}")
+
+    return all_results
+
+
 def save_results(conn: duckdb.DuckDBPyConnection, results: list):
-    """Save categorization results to database."""
+    """Save categorization results to database. Thread-safe."""
     if not results:
         return
 
-    for r in results:
-        conn.execute("""
-            INSERT INTO tweet_categories (tweet_id, category, confidence, raw_response)
-            VALUES (?, ?, ?, ?)
-        """, (r["tweet_id"], r["category"], r["confidence"], r["raw_response"]))
+    with db_lock:
+        for r in results:
+            conn.execute("""
+                INSERT INTO tweet_categories (tweet_id, category, confidence, raw_response)
+                VALUES (?, ?, ?, ?)
+            """, (r["tweet_id"], r["category"], r["confidence"], r["raw_response"]))
 
 
 def show_stats(conn: duckdb.DuckDBPyConnection):
