@@ -20,7 +20,6 @@ DEFAULT_DB_PATH = "twitter.db"
 BATCH_SIZE = 10  # Number of tweets per API call
 SAVE_INTERVAL = 50  # Save progress every N tweets
 RATE_LIMIT_DELAY = 0.5  # Seconds between API calls
-MAX_CUSTOM_CATEGORIES = 20  # Limit on dynamic category creation
 
 # Standard categories that are always available
 STANDARD_CATEGORIES = [
@@ -107,12 +106,7 @@ def get_custom_category_count(conn: duckdb.DuckDBPyConnection) -> int:
 
 def add_custom_category(conn: duckdb.DuckDBPyConnection, category_name: str,
                         description: str, example_tweet_id: str) -> bool:
-    """Add a new custom category if under the limit."""
-    current_count = get_custom_category_count(conn)
-    if current_count >= MAX_CUSTOM_CATEGORIES:
-        print(f"  ⚠️  Cannot add '{category_name}': maximum {MAX_CUSTOM_CATEGORIES} custom categories reached")
-        return False
-
+    """Add a new custom category. No limit on number of categories."""
     # Validate category name format (lowercase, single word or hyphenated)
     if not re.match(r'^[a-z][a-z0-9-]*$', category_name):
         print(f"  ⚠️  Invalid category name format: '{category_name}'")
@@ -245,15 +239,14 @@ def categorize_batch(client, conn: duckdb.DuckDBPyConnection, tweets: list) -> l
 
     # Get custom categories at batch start
     custom_categories = get_custom_categories(conn)
-    can_create_new = get_custom_category_count(conn) < MAX_CUSTOM_CATEGORIES
 
     for tweet_id, full_text, created_at, lang in tweets:
         if shutdown_requested:
             break
 
         try:
-            # Build dynamic prompt with current custom categories
-            prompt_template = build_category_prompt(custom_categories, can_create_new)
+            # Build dynamic prompt with current custom categories (always allow new categories)
+            prompt_template = build_category_prompt(custom_categories, can_create_new=True)
             prompt = prompt_template.format(tweet_text=full_text[:1000])  # Limit text length
 
             response = client.models.generate_content(
@@ -289,11 +282,10 @@ def categorize_batch(client, conn: duckdb.DuckDBPyConnection, tweets: list) -> l
                 cat_name = new_category.get("name", "").lower().strip()
                 cat_desc = new_category.get("description", "")
 
-                if cat_name and cat_desc and can_create_new:
+                if cat_name and cat_desc:
                     if add_custom_category(conn, cat_name, cat_desc, tweet_id):
                         # Refresh custom categories for subsequent tweets in this batch
                         custom_categories = get_custom_categories(conn)
-                        can_create_new = get_custom_category_count(conn) < MAX_CUSTOM_CATEGORIES
 
             # Track custom category usage
             existing_custom_cats = {c[0] for c in custom_categories}
@@ -303,7 +295,7 @@ def categorize_batch(client, conn: duckdb.DuckDBPyConnection, tweets: list) -> l
                 cat_lower = cat.lower() if isinstance(cat, str) else str(cat).lower()
 
                 # If category is not known, try to auto-create it
-                if cat_lower not in all_known_cats and can_create_new:
+                if cat_lower not in all_known_cats:
                     # Check if it's a valid category name format
                     if re.match(r'^[a-z][a-z0-9-]*$', cat_lower):
                         # Auto-create the category
@@ -312,7 +304,6 @@ def categorize_batch(client, conn: duckdb.DuckDBPyConnection, tweets: list) -> l
                             custom_categories = get_custom_categories(conn)
                             existing_custom_cats = {c[0] for c in custom_categories}
                             all_known_cats = set(STANDARD_CATEGORIES) | existing_custom_cats
-                            can_create_new = get_custom_category_count(conn) < MAX_CUSTOM_CATEGORIES
 
                 # Increment usage count for custom categories
                 if cat_lower in existing_custom_cats:
@@ -395,7 +386,7 @@ def show_stats(conn: duckdb.DuckDBPyConnection):
         print("\n✨ Custom Categories:")
         print("-" * 50)
         custom_count = len(custom_cats)
-        print(f"  ({custom_count}/{MAX_CUSTOM_CATEGORIES} custom categories used)")
+        print(f"  ({custom_count} custom categories)")
         print()
         for category, count in custom_results:
             pct = (count / total * 100) if total > 0 else 0
@@ -501,9 +492,9 @@ def main():
     # Show custom category status
     custom_count = get_custom_category_count(conn)
     if custom_count > 0:
-        print(f"✨ Using {custom_count} custom categories (max {MAX_CUSTOM_CATEGORIES})")
+        print(f"✨ Using {custom_count} custom categories (unlimited)")
     else:
-        print(f"✨ Dynamic category creation enabled (max {MAX_CUSTOM_CATEGORIES})")
+        print(f"✨ Dynamic category creation enabled (unlimited)")
 
     # Configure Gemini API client
     client = genai.Client(api_key=api_key)
