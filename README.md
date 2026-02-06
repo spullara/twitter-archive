@@ -158,11 +158,67 @@ result = conn.execute('SELECT COUNT(*) FROM tweets').fetchone()
 print(f'Total tweets: {result[0]}')"
 ```
 
+## Tweet Categorization
+
+Use Gemini AI to automatically categorize tweets into categories like technical, personal, humor, social, etc.
+
+### Setup
+
+1. Add your Gemini API key to `.env`:
+   ```
+   GEMINI_API_KEY=your_api_key_here
+   ```
+
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+### Usage
+
+```bash
+# Test with a sample of 10 tweets first
+python categorize_tweets.py --sample 10
+
+# Run full categorization (can be interrupted and resumed)
+python categorize_tweets.py
+
+# View current statistics
+python categorize_tweets.py --stats
+
+# Reset all categories and start fresh
+python categorize_tweets.py --reset
+```
+
+The script:
+- **Stoppable**: Press Ctrl+C to safely stop and save progress
+- **Restartable**: Run again to continue from where you left off
+- **Resettable**: Use `--reset` to clear all categories
+
+### Query Categories
+
+```sql
+-- Category distribution
+SELECT category, COUNT(*) as count
+FROM tweet_categories
+GROUP BY category
+ORDER BY count DESC;
+
+-- Tweets by category
+SELECT t.full_text, tc.category, tc.confidence
+FROM tweets t
+JOIN tweet_categories tc ON t.tweet_id = tc.tweet_id
+WHERE tc.category = 'technical'
+ORDER BY tc.confidence DESC
+LIMIT 20;
+```
+
 ## Files
 
 - `schema.sql` - Database schema with all 10 tables
 - `import_tweets.py` - Imports tweets and related entities
 - `import_metadata.py` - Imports likes, followers, following, account
-- `requirements.txt` - Python dependencies (duckdb)
+- `categorize_tweets.py` - AI-powered tweet categorization
+- `requirements.txt` - Python dependencies
 - `twitter.db` - Generated database (after running import scripts)
 

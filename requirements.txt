@@ -1,2 +1,4 @@
 duckdb
+python-dotenv
+google-genai
 
