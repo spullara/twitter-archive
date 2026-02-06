@@ -2,6 +2,7 @@ archive/
 .env
 venv/
 twitter.db
+twitter.db.wal
 __pycache__/
 twitter.sqlite3
 categorization.log
