@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import logging
 import os
 import re
 import signal
@@ -20,6 +21,65 @@ DEFAULT_DB_PATH = "twitter.db"
 BATCH_SIZE = 10  # Number of tweets per API call
 SAVE_INTERVAL = 50  # Save progress every N tweets
 RATE_LIMIT_DELAY = 0.5  # Seconds between API calls
+LOG_FILE = "categorization.log"
+
+# Set up file logger for detailed categorization logging
+cat_logger = logging.getLogger("categorization")
+cat_logger.setLevel(logging.INFO)
+
+# Create file handler with append mode
+_file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
+_file_handler.setLevel(logging.INFO)
+
+# Create a clean, human-readable format
+_formatter = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+_file_handler.setFormatter(_formatter)
+
+# Add handler to logger (avoid duplicates on reimport)
+if not cat_logger.handlers:
+    cat_logger.addHandler(_file_handler)
+
+
+def log_tweet_processing(tweet_id: str, full_text: str, categories: list,
+                         primary_category: str, confidence: float):
+    """Log a tweet being processed with its categorization results."""
+    # Truncate text to first 100 chars for readability
+    text_preview = full_text[:100].replace('\n', ' ')
+    if len(full_text) > 100:
+        text_preview += "..."
+
+    cat_logger.info(f"Processing tweet {tweet_id}")
+    cat_logger.info(f"  Text: \"{text_preview}\"")
+    cat_logger.info(f"  Categories: {', '.join(categories)}")
+    cat_logger.info(f"  Primary: {primary_category} (confidence: {confidence:.2f})")
+
+
+def log_new_category_created(category_name: str, description: str, tweet_id: str):
+    """Log when a new custom category is created."""
+    cat_logger.info(f"NEW CATEGORY CREATED: {category_name}")
+    cat_logger.info(f"  Description: {description}")
+    cat_logger.info(f"  First tweet: {tweet_id}")
+
+
+def log_session_start(tweet_count: int, custom_category_count: int):
+    """Log the start of a categorization session."""
+    cat_logger.info("=" * 60)
+    cat_logger.info(f"CATEGORIZATION SESSION STARTED")
+    cat_logger.info(f"  Tweets to process: {tweet_count}")
+    cat_logger.info(f"  Existing custom categories: {custom_category_count}")
+    cat_logger.info("=" * 60)
+
+
+def log_session_end(total_processed: int, elapsed_seconds: float, new_categories: int):
+    """Log the end of a categorization session."""
+    cat_logger.info("-" * 60)
+    cat_logger.info(f"CATEGORIZATION SESSION ENDED")
+    cat_logger.info(f"  Tweets processed: {total_processed}")
+    cat_logger.info(f"  Time elapsed: {elapsed_seconds:.1f} seconds")
+    cat_logger.info(f"  Rate: {total_processed / elapsed_seconds:.1f} tweets/sec" if elapsed_seconds > 0 else "  Rate: N/A")
+    cat_logger.info(f"  New categories created: {new_categories}")
+    cat_logger.info("-" * 60)
+
 
 # Standard categories that are always available
 STANDARD_CATEGORIES = [
@@ -123,6 +183,7 @@ def add_custom_category(conn: duckdb.DuckDBPyConnection, category_name: str,
             VALUES (?, ?, ?)
         """, (category_name, description, example_tweet_id))
         print(f"  ✨ New category created: '{category_name}' - {description}")
+        log_new_category_created(category_name, description, example_tweet_id)
         return True
     except Exception as e:
         # Might be a duplicate key, which is fine
@@ -286,6 +347,16 @@ def categorize_batch(client, conn: duckdb.DuckDBPyConnection, tweets: list) -> l
                     if add_custom_category(conn, cat_name, cat_desc, tweet_id):
                         # Refresh custom categories for subsequent tweets in this batch
                         custom_categories = get_custom_categories(conn)
+
+            # Log the tweet processing and categorization decision
+            primary_category = data.get("primary", categories[0] if categories else "other")
+            log_tweet_processing(
+                tweet_id=tweet_id,
+                full_text=full_text,
+                categories=categories,
+                primary_category=primary_category,
+                confidence=confidence
+            )
 
             # Track custom category usage
             existing_custom_cats = {c[0] for c in custom_categories}
@@ -491,6 +562,7 @@ def main():
 
     # Show custom category status
     custom_count = get_custom_category_count(conn)
+    custom_count_before = custom_count  # Track for logging new categories at end
     if custom_count > 0:
         print(f"✨ Using {custom_count} custom categories (unlimited)")
     else:
@@ -503,6 +575,9 @@ def main():
     total_processed = 0
     all_results = []
     start_time = time.time()
+
+    # Log session start
+    log_session_start(len(tweets), custom_count)
 
     print("\n🚀 Starting categorization...")
 
@@ -539,6 +614,11 @@ def main():
 
     elapsed = time.time() - start_time
     print(f"\n⏱️  Completed in {elapsed:.1f} seconds ({total_processed / elapsed:.1f} tweets/sec)")
+
+    # Log session end
+    custom_count_after = get_custom_category_count(conn)
+    new_categories_created = custom_count_after - custom_count_before
+    log_session_end(total_processed, elapsed, new_categories_created)
 
     show_stats(conn)
     conn.close()
