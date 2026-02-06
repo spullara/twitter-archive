@@ -4,3 +4,4 @@ venv/
 twitter.db
 __pycache__/
 twitter.sqlite3
+categorization.log
