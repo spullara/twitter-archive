@@ -2,3 +2,5 @@ archive/
 .env
 venv/
 twitter.db
+__pycache__/
+twitter.sqlite3
